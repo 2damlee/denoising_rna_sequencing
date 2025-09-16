@@ -1,7 +1,80 @@
 from __future__ import annotations
 from typing import Dict, Optional, Tuple
+from scipy import sparse
+import time
 import numpy as np
+import os
 
+DEBUG = True            # flip to False to silence console logs
+_LOG_FILE: Optional[str] = os.environ.get("DCA_LOG_FILE", None)  # optional file log
+
+def set_debug(flag: bool = True):
+    """Enable/disable console debug prints."""
+    global DEBUG
+    DEBUG = bool(flag)
+
+def set_log_file(path: Optional[str]):
+    """Append logs to a file. Set None to disable file logging."""
+    global _LOG_FILE
+    _LOG_FILE = path
+
+def _append_line(path: str, line: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(line + "\n")
+
+def log(msg: str):
+    """Lightweight logger: prints when DEBUG and optionally appends to _LOG_FILE."""
+    line = f"{time.strftime('%F %T')} | {msg}"
+    if DEBUG:
+        print(line, flush=True)
+    if _LOG_FILE:
+        _append_line(_LOG_FILE, line)
+
+def heartbeat(path: str, msg: str):
+    """Write progress line to a file so you can `tail -f` it."""
+    _append_line(path, f"{time.strftime('%F %T')} {msg}")
+
+class Timer:
+    """Context manager to measure wall time."""
+    def __init__(self, label: str):
+        self.label, self.t0 = label, None
+    def __enter__(self):
+        self.t0 = time.time()
+        log(f"[time] {self.label} start")
+        return self
+    def __exit__(self, *exc):
+        dt = time.time() - self.t0
+        log(f"[time] {self.label} end in {dt:.2f}s")
+
+def shape_dtype(name: str, X):
+    """Print basic shape/dtype + sparsity."""
+    if sparse.issparse(X):
+        total = X.shape[0] * X.shape[1]
+        dens = (X.nnz / total) if total else 0.0
+        log(f"{name}: sparse {X.shape} dtype={X.dtype} nnz={X.nnz} ({dens:.4%} dense)")
+    else:
+        log(f"{name}: dense  {X.shape} dtype={X.dtype}")
+
+def sanity_counts(name: str, X):
+    """Raise early if matrix looks broken."""
+    Xd = X.A if sparse.issparse(X) else X
+    if Xd.size == 0:
+        raise ValueError(f"{name} is empty")
+    if np.isnan(Xd).any():
+        raise ValueError(f"{name} has NaNs")
+    if (Xd < 0).any():
+        raise ValueError(f"{name} has negative values")
+    approx_int = np.allclose(Xd, np.rint(Xd))
+    log(f"{name}: zeros={(Xd==0).mean():.2%}, approx_int={approx_int}")
+
+def to_int_if_close(X: np.ndarray) -> np.ndarray:
+    """If X is approximately integer, round to int64; else return X unchanged."""
+    X = np.asarray(X)
+    if np.allclose(X, np.rint(X)):
+        return np.rint(X).astype(np.int64)
+    return X
+    
 # ===================== Masking helpers =====================
 
 def make_mask_nonzero_by_gene(X: np.ndarray, frac: float, rng: np.random.Generator) -> np.ndarray:
