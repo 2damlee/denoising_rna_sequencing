@@ -89,28 +89,36 @@ class _MAGICModel:
         with ut.Timer("[MAGIC] fit"):
             self.op_.fit(np.asarray(X, dtype=np.float64))
         return self
-    def predict_mean(self, X: np.ndarray, mask: Optional[np.ndarray] = None, X_train_ref: Optional[np.ndarray] = None) -> np.ndarray:
-        ut.log("[MAGIC] predict_mean")
+    def predict_mean(self, X, mask=None, X_train_ref=None):
         from magic import MAGIC
         if self.op_ is None:
             raise RuntimeError("Call fit() before predict_mean().")
         X = np.asarray(X, dtype=np.float64)
+
+        # If mask is given, hide those entries in the eval matrix
+        X_eval = X.copy()
+        if mask is not None:
+            X_eval[mask] = 0.0   # (or np.nan, but 0.0 is the safer default here)
+
+        # Prefer out-of-sample transform
         if hasattr(self.op_, "transform"):
             try:
                 with ut.Timer("[MAGIC] transform"):
-                    return np.asarray(self.op_.transform(X), dtype=np.float64)
+                    return np.asarray(self.op_.transform(X_eval), dtype=np.float64)
             except Exception as e:
                 ut.log(f"[MAGIC] transform failed, refit fallback: {e}")
+
+        # Fallback: transductive fit on [train || eval_masked]
         if X_train_ref is not None:
-            X_tr = np.asarray(X_train_ref, dtype=np.float64)
-            X_concat = np.vstack([X_tr, X])
+            X_concat = np.vstack([np.asarray(X_train_ref, np.float64), X_eval])
             tmp = MAGIC(n_pca=self.n_pca, t=self.t, knn=self.knn)
             with ut.Timer("[MAGIC] concat fit_transform"):
                 X_imp = tmp.fit_transform(X_concat)
             return np.asarray(X_imp[-X.shape[0]:, :], dtype=np.float64)
+
         tmp = MAGIC(n_pca=self.n_pca, t=self.t, knn=self.knn)
         with ut.Timer("[MAGIC] fit_transform"):
-            return np.asarray(tmp.fit_transform(X), dtype=np.float64)
+            return np.asarray(tmp.fit_transform(X_eval), dtype=np.float64)
 
 def build_baseline(name: str, **params) -> Any:
     nm = name.upper()
@@ -163,19 +171,45 @@ class DCAPredictWrapper:
 
         ad_all = ad.AnnData(X_concat)
         ad_all.obs["dca_split"] = np.array(["train"] * n_tr + ["test"] * n_ev, dtype=object)
+        
+        from keras import backend as K
+        K.clear_session()
 
-        with ut.Timer("[DCA] train(dca.api.dca)"):
-            dca(ad_all,
-                hidden_size=self.hidden_size,
-                epochs=self.epochs,
-                batch_size=self.batch_size,
-                return_model=False,
-                copy=False,
-                random_state=self.random_state)
+        import dca.train as dca_train
+        from keras import optimizers as _k_optim
+        assert hasattr(_k_optim, "legacy"), "Your Keras build must expose `keras.optimizers.legacy`."
+        dca_train.opt = _k_optim.legacy       # <-- IMPORTANT
+        opt_name = "RMSprop"
+
+        import tensorflow as tf
+        with tf.compat.v1.Graph().as_default(), tf.compat.v1.Session().as_default() as _sess:
+            # Bind this session to any available backends
+            try:
+                tf.compat.v1.keras.backend.set_session(_sess)
+            except Exception:
+                pass
+            try:
+                if hasattr(K, "set_session"):
+                    K.set_session(_sess)
+            except Exception:
+                pass
+
+            with ut.Timer("[DCA] train(dca.api.dca)"):
+                dca(
+                    ad_all,
+                    hidden_size=self.hidden_size,
+                    epochs=self.epochs,
+                    batch_size=self.batch_size,
+                    optimizer=opt_name,    # resolved through dca.train.opt (legacy table)
+                    return_model=False,
+                    copy=False,
+                    random_state=self.random_state,
+                )
 
         if "X_dca" in ad_all.layers:
             return np.asarray(ad_all.layers["X_dca"][-n_ev:, :])
         return np.asarray(ad_all.X[-n_ev:, :])
+
 
 # ---------- scVI wrapper ----------
 class SCVIWrapper:
@@ -326,6 +360,23 @@ def cv_dca_5fold(
     """
     5-fold CV for DCA with two masking protocols. Logs progress & shapes.
     """
+
+    # --- local helper: make params hashable for pandas groupby (lists -> tuples, numpy scalars -> py scalars)
+    def _to_hashable(obj: Any) -> Any:
+        """Convert nested structures to hashable (dict values become tuples if sequences)."""
+        import numpy as _np
+        if isinstance(obj, dict):
+            return {k: _to_hashable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, _np.ndarray)):
+            return tuple(_to_hashable(x) for x in list(obj))
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, (_np.bool_,)):
+            return bool(obj)
+        return obj
+
     ut.log(f"[cv_dca_5fold] start k={k} n_hvg={n_hvg} mode={hvg_mode} R={R} "
            f"mask_frac={mask_frac} thinning_p={thinning_p}")
     if dca_params is None:
@@ -385,22 +436,38 @@ def cv_dca_5fold(
             # Nonzero Zeroing (reuse mu_va)
             zero_errs, zero_nbs = [], []
             for r in range(R):
-                rng = np.random.default_rng(random_state + fold_id * 1000 + r)
-                M_zero = ut.make_mask_nonzero_by_gene(X_va_G, frac=mask_frac, rng=rng)
+                # separate RNG for zeroing
+                rng_zero = np.random.default_rng(random_state + 1111 + fold_id * 1000 + r)
+                M_zero = ut.make_mask_nonzero_by_gene(X_va_G, frac=mask_frac, rng=rng_zero) 
+
+                X_va_masked = X_va_G.copy()
+                X_va_masked[M_zero] = 0  # hide the masked entries in the input
+
+                mu_zero = dca.predict_mean(X_va_masked)
+
                 rows, cols = np.where(M_zero)
                 y_true = X_va_G[rows, cols]
-                y_pred = mu_va[rows, cols]
+                y_pred = mu_zero[rows, cols]
                 th = theta_G[cols]
+
                 zero_errs.append(ut._basic_errors(y_true, y_pred))
                 zero_nbs.append(ut._nb_scores(y_true, y_pred, th))
 
             # Binomial Thinning (reuse mu_va scaled)
             thin_errs, thin_nbs = [], []
             for r in range(R):
-                rng = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
-                X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng)
+                # separate RNG for thinning
+                rng_thin = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
+
+                X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng_thin)
+
+                # predict mean from the kept counts only
+                mu_keep = dca.predict_mean(X_keep)
+
+                # target is the held-out mass; scale prediction accordingly
                 y_true = X_hold
-                y_pred = mu_va * float(thinning_p)
+                y_pred = (thinning_p / (1.0 - thinning_p)) * mu_keep
+
                 thin_errs.append(ut._basic_errors(y_true, y_pred))
                 thin_nbs.append(ut._nb_scores(y_true, y_pred, theta_G))
 
@@ -412,10 +479,13 @@ def cv_dca_5fold(
             T_med = float(np.mean([d["MedianL1"] for d in thin_errs]))
             T_ll  = float(np.mean([d["NB_ll"] for d in thin_nbs])); T_dev = float(np.mean([d["NB_dev"] for d in thin_nbs]))
 
+            # Make params hashable before storing into the DataFrame (so groupby won't fail)
+            params_clean = _to_hashable(dca_params)
+
             row = {
                 "fold": fold_id,
                 "model": "DCA",
-                "params": dca_params,
+                "params": params_clean,  # <-- hashable dict (lists converted to tuples)
                 "n_hvg": int(len(G)),
                 "MAE_zero": Z_mae, "MSE_zero": Z_mse, "MedianL1_zero": Z_med,
                 "NB_ll_zero": Z_ll, "NB_dev_zero": Z_dev,
@@ -528,7 +598,7 @@ def cv_baselines_5fold(
                     batch_key=batch_key,
                 )
             ut.log(f"[BASE] fold {fold_id} | HVG={len(G)}")
-
+            
             X_tr_G = X_tr[:, G]
             X_va_G = X_va[:, G]
             theta_G = ut.estimate_nb_theta_moments(X_tr_G)
@@ -550,7 +620,7 @@ def cv_baselines_5fold(
                         mu_full = X_va_G
                     sil = ut.bio_silhouette_score(mu_full, labels[va_idx] if labels is not None else None)
 
-                    # Nonzero Zeroing
+                    # 1. Nonzero Zeroing
                     zero_errs, zero_nbs = [], []
                     for r in range(R):
                         rng = np.random.default_rng(random_state + fold_id * 1000 + r)
@@ -563,15 +633,23 @@ def cv_baselines_5fold(
                         zero_errs.append(ut._basic_errors(y_true, y_pred))
                         zero_nbs.append(ut._nb_scores(y_true, y_pred, th))
 
-                    # Binomial Thinning
+                    # 2. Binomial Thinning
                     thin_errs, thin_nbs = [], []
                     for r in range(R):
-                        rng = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
-                        X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng)
-                        M_all = np.ones_like(X_keep, dtype=bool)
-                        mu_thin = ut._predict_full_matrix(mdl, X_keep, mask=M_all, X_train_ref=X_tr_G)
+                        rng_thin = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
+
+                        X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng_thin)
+
+                        # For KNN, pass an all-False mask so we do NOT inject NaNs.
+                        mask_all_false = np.zeros_like(X_keep, dtype=bool)
+
+                        mu_keep = ut._predict_full_matrix(
+                            mdl, X_keep, mask=mask_all_false, X_train_ref=X_tr_G
+                        )
+
                         y_true = X_hold
-                        y_pred = mu_thin * float(thinning_p)
+                        y_pred = (thinning_p / (1.0 - thinning_p)) * mu_keep
+
                         thin_errs.append(ut._basic_errors(y_true, y_pred))
                         thin_nbs.append(ut._nb_scores(y_true, y_pred, theta_G))
 
@@ -615,177 +693,6 @@ def cv_baselines_5fold(
     ut.log("[cv_baselines_5fold] done")
     return summary, detailed_df
 
-def run_dca_nested(
-    X_counts: np.ndarray,
-    hvg_mode: str,
-    hvg_grid: List[int],
-    batches: Optional[np.ndarray] = None,
-    norm_layer: Optional[np.ndarray] = None,
-    gene_names: Optional[np.ndarray] = None,
-    batch_key: str = "batch",
-    seurat_layer_name: str = "log2_1p_CPM_original",
-    outer_k: int = 5,
-    inner_k: int = 3,
-    R: int = 3,
-    mask_frac: float = 0.1,
-    random_state: int = 123,
-    dca_grid: Optional[Dict[str, List[Any]]] = None,
-    one_se_rule: bool = True,
-    save_dir: Optional[str] = None,
-    heartbeat_path: Optional[str] = None,
-) -> pd.DataFrame:
-    ut.log(f"[run_dca_nested] start outer_k={outer_k} inner_k={inner_k} grid={dca_grid} hvg_grid={hvg_grid}")
-    from sklearn.model_selection import KFold, ParameterGrid
-
-    if dca_grid is None:
-        dca_grid = {"hidden_size": [[64,32,64]], "epochs": [300], "batch_size": [128]}
-
-    X_counts = np.asarray(X_counts)
-    ut.shape_dtype("X_counts", X_counts)
-    ut.sanity_counts("X_counts", X_counts)
-    n_samples, n_genes = X_counts.shape
-
-    if hvg_mode not in ("variance", "seurat_v3"):
-        raise ValueError("hvg_mode must be 'variance' or 'seurat_v3'.")
-    if hvg_mode == "seurat_v3":
-        if gene_names is None or len(gene_names) != n_genes:
-            raise ValueError("Provide gene_names (len == n_genes) for seurat_v3 HVG.")
-        if batches is None or len(batches) != n_samples:
-            raise ValueError("Provide batches (len == n_samples) for seurat_v3 HVG.")
-        if norm_layer is None or norm_layer.shape != X_counts.shape:
-            raise ValueError("Provide norm_layer with same shape as X_counts for seurat_v3 HVG.")
-
-    outer_cv = KFold(n_splits=outer_k, shuffle=True, random_state=random_state)
-    records = []
-
-    for ofold, (tr_idx, te_idx) in enumerate(outer_cv.split(X_counts), start=1):
-        _hb(heartbeat_path, f"NESTED outer {ofold}/{outer_k} start")
-        with ut.Timer(f"[NESTED] outer {ofold}/{outer_k}"):
-            X_tr_out, X_te_out = X_counts[tr_idx], X_counts[te_idx]
-            inner_cv = KFold(n_splits=inner_k, shuffle=True, random_state=random_state + 7)
-            score_rows = []
-
-            for ifold, (tr_in_idx, val_in_idx) in enumerate(inner_cv.split(X_tr_out), start=1):
-                with ut.Timer(f"[NESTED] outer {ofold} inner {ifold}"):
-                    X_tr_in, X_val_in = X_tr_out[tr_in_idx], X_tr_out[val_in_idx]
-
-                    rank_slices: Dict[int, np.ndarray] = {}
-                    theta_map:   Dict[int, np.ndarray] = {}
-
-                    if hvg_mode == "variance":
-                        rank = ut.rank_hvg_by_variance(X_tr_in)
-                        for n in hvg_grid:
-                            idx = rank[:min(n, X_tr_in.shape[1])]
-                            rank_slices[n] = idx
-                            theta_map[n]   = ut.estimate_nb_theta_moments(X_tr_in[:, idx])
-                    else:
-                        b_tr_in   = batches[tr_idx][tr_in_idx]
-                        norm_in   = norm_layer[tr_idx][tr_in_idx, :]
-                        for n in hvg_grid:
-                            idx = ut.seurat_v3_hvg_indices_for_train_split(
-                                X_train_counts=X_tr_in,
-                                gene_names=gene_names,
-                                batch_labels_train=b_tr_in,
-                                normalized_train_matrix=norm_in,
-                                n_top_genes=n,
-                                layer_name=seurat_layer_name,
-                                batch_key=batch_key,
-                            )
-                            rank_slices[n] = idx
-                            theta_map[n]   = ut.estimate_nb_theta_moments(X_tr_in[:, idx])
-
-                    for hp in ParameterGrid(dca_grid):
-                        for n in hvg_grid:
-                            G = rank_slices[n]
-                            X_tr_G  = X_tr_in[:, G]
-                            X_val_G = X_val_in[:, G]
-                            theta   = theta_map[n]
-
-                            dca = DCAPredictWrapper(**hp, random_state=random_state + ofold*100 + ifold).fit(X_tr_G)
-
-                            ll_list, dev_list, mae_list = [], [], []
-                            for r in range(R):
-                                rng = np.random.default_rng(random_state + ofold*1000 + ifold*100 + r)
-                                # stratified mask ~ use nonzero-per-gene here too
-                                M = ut.make_mask_nonzero_by_gene(X_val_G, frac=mask_frac, rng=rng)
-                                mu = dca.predict_mean(X_val_G)
-
-                                rows, cols = np.where(M)
-                                y_true, y_pred = X_val_G[rows, cols], mu[rows, cols]
-                                th = theta[cols]
-                                ll_list.append(ut.nb_logpmf(y_true, y_pred, th).mean())
-                                dev_list.append(ut.nb_deviance(y_true, y_pred, th).mean())
-                                mae_list.append(np.mean(np.abs(y_true - y_pred)))
-
-                            score_rows.append(((hp, n),
-                                               float(np.mean(ll_list)),
-                                               float(np.mean(dev_list)),
-                                               float(np.mean(mae_list)),
-                                               float(np.std(ll_list, ddof=1) if len(ll_list) > 1 else 0.0)))
-            # select
-            score_rows.sort(key=lambda t: (t[1], -t[2], -t[3]), reverse=True)
-            (best_hp, best_n), best_ll, _, _, best_std = score_rows[0]
-            if one_se_rule:
-                thr = best_ll - best_std
-                cands = [s for s in score_rows if s[1] >= thr]
-                cands.sort(key=lambda t: (t[0][1], -t[1], t[2], t[3]))  # smaller HVG first
-                (best_hp, best_n) = cands[0][0]
-            ut.log(f"[NESTED] outer {ofold} best: n_hvg={best_n} hp={best_hp}")
-
-            # outer retrain/eval
-            if hvg_mode == "variance":
-                rank_out = ut.rank_hvg_by_variance(X_tr_out)
-                G_out = rank_out[:min(best_n, X_tr_out.shape[1])]
-            else:
-                b_tr_out = batches[tr_idx]
-                norm_out = norm_layer[tr_idx, :]
-                G_out = ut.seurat_v3_hvg_indices_for_train_split(
-                    X_train_counts=X_tr_out,
-                    gene_names=gene_names,
-                    batch_labels_train=b_tr_out,
-                    normalized_train_matrix=norm_out,
-                    n_top_genes=best_n,
-                    layer_name=seurat_layer_name,
-                    batch_key=batch_key,
-                )
-
-            X_tr_G = X_tr_out[:, G_out]
-            X_te_G = X_te_out[:, G_out]
-            theta_out = ut.estimate_nb_theta_moments(X_tr_G)
-            dca_final = DCAPredictWrapper(**best_hp, random_state=random_state + ofold*777).fit(X_tr_G)
-
-            ll_list, dev_list, mae_list = [], [], []
-            for r in range(R):
-                rng = np.random.default_rng(random_state + 9999 + ofold*100 + r)
-                M_test = ut.make_mask_nonzero_by_gene(X_te_G, frac=mask_frac, rng=rng)
-                mu_test = dca_final.predict_mean(X_te_G)
-                rows_, cols_ = np.where(M_test)
-                y_true, y_pred = X_te_G[rows_, cols_], mu_test[rows_, cols_]
-                th = theta_out[cols_]
-                ll_list.append(ut.nb_logpmf(y_true, y_pred, th).mean())
-                dev_list.append(ut.nb_deviance(y_true, y_pred, th).mean())
-                mae_list.append(np.mean(np.abs(y_true - y_pred)))
-
-            records.append({
-                "outer_fold": ofold,
-                "model": "DCA",
-                "best_params": best_hp,
-                "best_n_hvg": int(best_n),
-                "NB_loglik_mean": float(np.mean(ll_list)),
-                "NB_deviance_mean": float(np.mean(dev_list)),
-                "MAE_mean": float(np.mean(mae_list)),
-            })
-            _maybe_flush_csv(pd.DataFrame(records), save_dir, "nested_partial")
-        _hb(heartbeat_path, f"NESTED outer {ofold}/{outer_k} done")
-
-    df = pd.DataFrame(records)
-    if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        fp = f"{save_dir}/results.csv"
-        df.to_csv(fp, index=False)
-        ut.log(f"[run_dca_nested] wrote {fp}")
-    ut.log("[run_dca_nested] done")
-    return df
 
 def cv_scvi_5fold(
     X_counts: np.ndarray,
@@ -898,29 +805,39 @@ def cv_scvi_5fold(
 
                 zero_errs, zero_nbs = [], []
                 for r in range(R):
-                    rng = np.random.default_rng(random_state + fold_id * 1000 + r)
-                    M_zero = ut.make_mask_nonzero_by_gene(X_va_G, frac=mask_frac, rng=rng)
+                    rng_zero = np.random.default_rng(random_state + 1111 + fold_id * 1000 + r)
+
+                    M_zero = ut.make_mask_nonzero_by_gene(X_va_G, frac=mask_frac, rng=rng_zero)
+                    X_va_masked = X_va_G.copy()
+                    X_va_masked[M_zero] = 0
+
                     mu_zero = mdl.predict_mean(
-                        X_va_G,
+                        X_va_masked,
                         eval_batches=(batches[va_idx] if batches is not None else None),
                     )
+
                     rows, cols = np.where(M_zero)
                     y_true = X_va_G[rows, cols]
                     y_pred = mu_zero[rows, cols]
                     th = theta_G[cols]
+
                     zero_errs.append(ut._basic_errors(y_true, y_pred))
                     zero_nbs.append(ut._nb_scores(y_true, y_pred, th))
 
                 thin_errs, thin_nbs = [], []
                 for r in range(R):
-                    rng = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
-                    X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng)
-                    mu_thin = mdl.predict_mean(
+                    rng_thin = np.random.default_rng(random_state + 7777 + fold_id * 1000 + r)
+
+                    X_keep, X_hold = ut.binomial_thinning_split(X_va_G, p_hold=thinning_p, rng=rng_thin)
+
+                    mu_keep = mdl.predict_mean(
                         X_keep,
                         eval_batches=(batches[va_idx] if batches is not None else None),
                     )
+
                     y_true = X_hold
-                    y_pred = mu_thin * float(thinning_p)
+                    y_pred = (thinning_p / (1.0 - thinning_p)) * mu_keep
+
                     thin_errs.append(ut._basic_errors(y_true, y_pred))
                     thin_nbs.append(ut._nb_scores(y_true, y_pred, theta_G))
 

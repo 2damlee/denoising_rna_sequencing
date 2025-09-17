@@ -5,8 +5,8 @@ import time
 import numpy as np
 import os
 
-DEBUG = True            # flip to False to silence console logs
-_LOG_FILE: Optional[str] = os.environ.get("DCA_LOG_FILE", None)  # optional file log
+DEBUG = True
+_LOG_FILE: Optional[str] = os.environ.get("DCA_LOG_FILE", None)
 
 def set_debug(flag: bool = True):
     """Enable/disable console debug prints."""
@@ -14,7 +14,7 @@ def set_debug(flag: bool = True):
     DEBUG = bool(flag)
 
 def set_log_file(path: Optional[str]):
-    """Append logs to a file. Set None to disable file logging."""
+    """Append logs to a file. Set None to disable file logging. (tmux)"""
     global _LOG_FILE
     _LOG_FILE = path
 
@@ -84,6 +84,7 @@ def make_mask_nonzero_by_gene(X: np.ndarray, frac: float, rng: np.random.Generat
     """
     n_cells, n_genes = X.shape
     M = np.zeros_like(X, dtype=bool)
+    print(f"DEBUG, make_mask_nonzero_by_gene in utilities.py: {M}")
     for g in range(n_genes):
         nz = np.where(X[:, g] > 0)[0]
         if len(nz) == 0:
