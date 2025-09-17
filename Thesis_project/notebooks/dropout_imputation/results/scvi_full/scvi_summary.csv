@@ -1,0 +1,2 @@
+model,n_hvg,MAE_zero,MSE_zero,MedianL1_zero,NB_ll_zero,NB_dev_zero,MAE_thin,MSE_thin,MedianL1_thin,NB_ll_thin,NB_dev_thin,Silhouette,params
+scVI,800,469.78063021344724,51200694.511970505,131.91431121826173,-8.288211064777533,7.163435146789634,34.348442131125395,277234.70056599926,16.194820976257326,-2.384981245656923,2.654838382823042,,"{'batch_size': 512, 'dropout_rate': 0.1, 'lr': 0.0005, 'max_epochs': 300, 'n_hidden': 128, 'n_latent': 32, 'n_layers': 2, 'use_gpu': True, 'weight_decay': 1e-06}"
